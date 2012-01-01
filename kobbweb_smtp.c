@@ -2,7 +2,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
 
+#include <syslog.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -36,18 +39,36 @@ struct kw_text_chunk_t
     const char *text;
 };
 
+enum kw_command_t
+{
+    COMMAND_NONE = 0,
+    COMMAND_EHLO = 0x4f4c4845,
+    COMMAND_HELO = 0x4f4c4548,
+    COMMAND_MAIL = 0x4c49414d,
+    COMMAND_RCPT = 0x54504352,
+    COMMAND_DATA = 0x41544144,
+    COMMAND_RSET = 0x54455352,
+    COMMAND_VRFY = 0x59465256,
+    COMMAND_EXPN = 0x4e505845,
+    COMMAND_HELP = 0x504c4548,
+    COMMAND_NOOP = 0x504f4f4e,
+    COMMAND_QUIT = 0x54495551
+};
+
 enum kw_state_t
 {
     STATE_NEW,
     STATE_SSL_START,
     STATE_SSL_ACCEPT,
     STATE_HANDLE_COMMAND,
-    STATE_DONE
+    STATE_DONE,
+    STATE_INVALID = -1
 };
 
 struct kw_connection_t;
 
-typedef int (*kw_transmit_function_t)(struct kw_connection_t *, void *, size_t);
+typedef ssize_t (*kw_read_function_t)(struct kw_connection_t *, void *, size_t);
+typedef ssize_t (*kw_write_function_t)(struct kw_connection_t *, const void *, size_t);
 
 #define CONNECTION_BUFFER_SIZE (16 * 1024 * 1024)
 
@@ -57,15 +78,46 @@ struct kw_connection_t
     int valid;
     SSL *ssl;
     enum kw_state_t state;
-    kw_transmit_function_t read;
-    kw_transmit_function_t write;
+    enum kw_command_t command;
+    kw_read_function_t read;
+    kw_write_function_t write;
     char *buffer;
+    char *buffer_end;
+    char *buffer_ptr;
 };
 
 static struct kw_connection_t **kw_connections;
 static size_t kw_current_connection;
 static size_t kw_num_connections;
 static SSL_CTX *kw_ssl_ctx;
+
+static void
+kw_log_connection_error(struct kw_connection_t *conn, int priority)
+{
+#define BUFFER_SIZE 1024
+    char buffer[BUFFER_SIZE + 1];
+
+    if (conn->ssl && ERR_peek_error() != 0)
+    {
+        unsigned long error_code;
+        SSL_load_error_strings();
+
+        while (ERR_peek_error() != 0)
+        {
+            error_code = ERR_get_error();
+            ERR_error_string_n(error_code, buffer, BUFFER_SIZE);
+            buffer[BUFFER_SIZE] = 0;
+            syslog(priority, "%s", buffer);
+        }
+    }
+
+    if (errno)
+    {
+        strerror_r(errno, buffer, BUFFER_SIZE);
+        buffer[BUFFER_SIZE] = 0;
+        syslog(priority, "%s", buffer);
+    }
+}
 
 static int
 kw_socket_open(int port)
@@ -103,47 +155,46 @@ kw_accept_and_add_to_epoll_list(int epoll_fd, int socket_fd)
     event.data.fd = new_connection_fd;
     VERIFY(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_connection_fd, &event) != -1);
 }
-
+/*
+static void *
+kw_alloc(struct kw_connection_t *conn, size_t size)
+{
+    char *ptr = conn->buffer_ptr;
+    size = (size + (sizeof(void *) - 1)) & (~(sizeof(void *) - 1));
+    conn->buffer_ptr += size;
+    return ptr;
+}
+*/
 static void
 kw_remove_from_epoll_list(int epoll_fd, int socket_fd)
 {
     VERIFY(epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socket_fd, NULL) != -1);
 }
 
-static int
+static ssize_t
 kw_read(struct kw_connection_t *conn, void *data, size_t size)
 {
-    UNUSED(conn);
-    UNUSED(data);
-    UNUSED(size);
-    return 0;
+    return read(conn->fd, data, size);
 }
 
-static int
-kw_write(struct kw_connection_t *conn, void *data, size_t size)
+static ssize_t
+kw_write(struct kw_connection_t *conn, const void *data, size_t size)
 {
-    UNUSED(conn);
-    UNUSED(data);
-    UNUSED(size);
-    return 0;
+    return write(conn->fd, data, size);
 }
 
-static int
+static ssize_t
 kw_read_ssl(struct kw_connection_t *conn, void *data, size_t size)
 {
-    UNUSED(conn);
-    UNUSED(data);
-    UNUSED(size);
-    return 0;
+    VERIFY(size < INT_MAX);
+    return SSL_read(conn->ssl, data, (int)size);
 }
 
-static int
-kw_write_ssl(struct kw_connection_t *conn, void *data, size_t size)
+static ssize_t
+kw_write_ssl(struct kw_connection_t *conn, const void *data, size_t size)
 {
-    UNUSED(conn);
-    UNUSED(data);
-    UNUSED(size);
-    return 0;
+    VERIFY(size < INT_MAX);
+    return SSL_write(conn->ssl, data, (int)size);
 }
 
 static void
@@ -154,8 +205,10 @@ kw_initialize_connection(struct kw_connection_t *conn)
     conn->fd = -1;
     conn->ssl = NULL;
     conn->state = STATE_NEW;
+    conn->command = COMMAND_NONE;
     conn->read = kw_read;
     conn->write = kw_write;
+    conn->buffer_ptr = conn->buffer;
 }
 
 static struct kw_connection_t *
@@ -186,6 +239,7 @@ kw_allocate_connection()
     {
         kw_connections[i] = new_connections + i;
         kw_connections[i]->buffer = &new_blocks[i * CONNECTION_BUFFER_SIZE];
+        kw_connections[i]->buffer_end = &new_blocks[(i + 1) * CONNECTION_BUFFER_SIZE];
     }
 
     kw_num_connections = new_num_elements;
@@ -240,6 +294,7 @@ kw_release_connection(struct kw_connection_t *conn, int fd)
     if (conn->ssl)
         SSL_free(conn->ssl);
     conn->valid = 0;
+    conn->state = STATE_INVALID;
 
     for (i = 0; i < kw_current_connection; ++i)
     {
@@ -262,9 +317,68 @@ kw_send_greeting(struct kw_connection_t *conn)
 }
 
 static void
+kw_command_ehlo(struct kw_connection_t *conn)
+{
+    UNUSED(conn);
+}
+
+static void
 kw_handle_command(struct kw_connection_t *conn)
 {
-    conn->state = STATE_DONE;
+    /* kw_handle_command reads all pending data into the buffer as scratch. 
+       It is up to the functions that are called by kw_handle_command to 
+       update the buffer pointers. */
+    int result;
+    int i;
+    static const char start_tls_token[] = "STARTTLS";
+    static const size_t start_tls_token_size = (sizeof start_tls_token) - 1;
+
+    union command_union
+    {
+        enum kw_command_t command;
+        char raw_data[4];
+    };
+
+    union command_union command_union;
+    
+    result = conn->read(conn, conn->buffer_ptr, conn->buffer_end - conn->buffer_ptr);
+    if (result < 0)
+    {
+        syslog(LOG_NOTICE, "Read function returned %d", result);
+        kw_log_connection_error(conn, LOG_NOTICE);
+        conn->state = STATE_DONE;
+        return;
+    }
+
+    for (i = 0; i < 4; ++i)
+        command_union.raw_data[i] = toupper(conn->buffer_ptr[i]);
+
+    conn->command = command_union.command;
+
+    switch (command_union.command)
+    {
+        case COMMAND_EHLO:
+            kw_command_ehlo(conn);
+            break;
+        case COMMAND_HELO:
+        case COMMAND_MAIL:
+        case COMMAND_RCPT:
+        case COMMAND_DATA:
+        case COMMAND_RSET:
+        case COMMAND_VRFY:
+        case COMMAND_EXPN:
+        case COMMAND_HELP:
+        case COMMAND_NOOP:
+        case COMMAND_QUIT:
+            break;
+        default:
+            if (strncasecmp(conn->buffer_ptr, start_tls_token, start_tls_token_size) == 0)
+            {
+                conn->command = COMMAND_NONE;
+                conn->state = STATE_SSL_START;
+            }
+            break;
+    }
 }
 
 static int
@@ -276,30 +390,37 @@ handle_connection(int fd)
     conn = kw_acquire_connection(fd);
     VERIFY(conn->valid);
 
-    switch (conn->state)
+    /* Some state-handling mechanisms like kw_handle_command will set the state
+       to STATE_DONE if an error has occurred and the connection needs to be 
+       shut down and cleaned up so this loop is here to handle that case properly.
+       */
+    do
     {
-        case STATE_NEW:
-            kw_send_greeting(conn);
-            conn->state = STATE_HANDLE_COMMAND;
-            break;
-        case STATE_HANDLE_COMMAND:
-            kw_handle_command(conn);
-            break;
-        case STATE_SSL_START:
-            kw_start_tls(conn);
-            conn->state = STATE_SSL_ACCEPT;
-            break;
-        case STATE_SSL_ACCEPT:
-            kw_accept_tls(conn);
-            conn->state = STATE_HANDLE_COMMAND;
-            break;
-        case STATE_DONE:
-            kw_release_connection(conn, fd);
-            rv = 1;
-            break;
-        default: 
-            break;
-    }
+        switch (conn->state)
+        {
+            case STATE_NEW:
+                kw_send_greeting(conn);
+                conn->state = STATE_HANDLE_COMMAND;
+                break;
+            case STATE_HANDLE_COMMAND:
+                kw_handle_command(conn);
+                break;
+            case STATE_SSL_START:
+                kw_start_tls(conn);
+                conn->state = STATE_SSL_ACCEPT;
+                break;
+            case STATE_SSL_ACCEPT:
+                kw_accept_tls(conn);
+                conn->state = STATE_HANDLE_COMMAND;
+                break;
+            case STATE_DONE:
+                kw_release_connection(conn, fd);
+                rv = 1;
+                break;
+            default: 
+                break;
+        }
+    } while (conn->state == STATE_DONE || conn->state == STATE_SSL_START);
 
     return rv;
 }
@@ -343,6 +464,13 @@ main(void)
     int socket_fds[2] = { -1, -1 };
     size_t i;
 
+#ifndef NDEBUG
+    int syslog_flags = LOG_PERROR;
+#else
+    int syslog_flags = 0;
+#endif
+
+    openlog("kobbweb_smtp", syslog_flags, LOG_USER);
     SSL_library_init();
     kw_initialize_ssl_ctx();
     epoll_fd = epoll_create1(0);
@@ -382,8 +510,12 @@ main(void)
 
                 /* TODO: Remove this. Temporarily exiting after each successful connection
                          to ease debuggability so that I don't have to break out of syscalls. */
-                return 0;
+                goto cleanup;
             }
         }
     }
+
+cleanup:
+    closelog();
+    return 0;
 }

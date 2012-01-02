@@ -315,9 +315,38 @@ kw_start_tls(struct kw_connection_t *conn)
 static void
 kw_accept_tls(struct kw_connection_t *conn)
 {
-    VERIFY_SSL(SSL_accept(conn->ssl));
-    conn->read = kw_read_ssl;
-    conn->write = kw_write_ssl;
+    int rv = SSL_accept(conn->ssl);
+    int error;
+    char error_buf[512];
+
+    if (rv == 1)
+    {
+        conn->read = kw_read_ssl;
+        conn->write = kw_write_ssl;
+        return;
+    }
+
+    error = SSL_get_error(conn->ssl, rv);
+    strerror_r(errno, error_buf, 511);
+    error_buf[511] = 0;
+
+#define CASE(X) case X: syslog(LOG_NOTICE, "SSL ERROR: (%d) %s - %s", rv, #X, error_buf); break
+    switch (error)
+    {
+        CASE(SSL_ERROR_NONE);
+        CASE(SSL_ERROR_ZERO_RETURN);
+        CASE(SSL_ERROR_WANT_READ);
+        CASE(SSL_ERROR_WANT_WRITE);
+        CASE(SSL_ERROR_WANT_CONNECT);
+        CASE(SSL_ERROR_WANT_ACCEPT);
+        CASE(SSL_ERROR_WANT_X509_LOOKUP);
+        CASE(SSL_ERROR_SYSCALL);
+        CASE(SSL_ERROR_SSL);
+        default:
+            syslog(LOG_NOTICE, "SSL ERROR: (%d) %d %s", rv, error, error_buf);
+            break;
+    }
+    raise(SIGTRAP);
 }
 
 static void
@@ -353,7 +382,8 @@ kw_send_response(struct kw_connection_t *conn, enum kw_response_t response)
     static const char *response_strings[] = {
         /* RESPONSE_GREETING */     "220 " DOMAIN " ESMTP" CRLF,
         /* RESPONSE_EHLO */         "250-" DOMAIN " ready to accept your load" CRLF
-                                    "250-STARTTLS" CRLF
+            /* TODO: TLS/SSL is disabled because it's causing problems currently. */
+/*                                    "250-STARTTLS" CRLF*/
                                     "250-8BITMIME" CRLF
                                     "250 SIZE " MAX_MESSAGE_SIZE_STRING CRLF,
         /* RESPONSE_HELO */         "250 " DOMAIN " ready to accept your load" CRLF,
@@ -457,7 +487,6 @@ kw_command_mail(struct kw_connection_t *conn)
     conn->from = chunk;
 
     kw_send_response(conn, RESPONSE_OK);
-    syslog(LOG_NOTICE, "Mail from: %s", string);
     return RESULT_OK;
 }
 
@@ -477,7 +506,6 @@ kw_command_rcpt(struct kw_connection_t *conn)
     conn->to = chunk;
 
     kw_send_response(conn, RESPONSE_OK);
-    syslog(LOG_NOTICE, "Mail to: %s", string);
     return RESULT_OK;
 }
 
@@ -517,7 +545,6 @@ kw_receive_data(struct kw_connection_t *conn)
     conn->data = chunk;
 
     kw_send_response(conn, RESPONSE_OK);
-    syslog(LOG_NOTICE, "Mail data: %s", data);
     return RESULT_OK;
 }
 

@@ -20,6 +20,8 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include <curl/curl.h>
+
 #define VERIFY_SSL_impl(x, line) if (!(x)) { \
     unsigned long error_code = ERR_get_error(); \
     char error_buf[512]; \
@@ -35,6 +37,7 @@
 #define VERIFY_SSL(x) VERIFY_SSL_impl(x, STRINGIZE(__LINE__))
 #define VERIFY(x) VERIFY_impl(x, STRINGIZE(__LINE__)) 
 #define UNUSED(x) (void)x
+#define MIN(a,b) ((a)<(b)?(a):(b))
 
 struct kw_text_chunk_t
 {
@@ -108,6 +111,10 @@ struct kw_connection_t
     enum kw_command_t command;
     kw_read_function_t read;
     kw_write_function_t write;
+
+    size_t post_fragment;
+    size_t post_pos;
+    size_t post_fragment_length;
     struct kw_text_chunk_t *to;
     struct kw_text_chunk_t *from;
     struct kw_text_chunk_t *data;
@@ -207,13 +214,21 @@ kw_remove_from_epoll_list(int epoll_fd, int socket_fd)
 static ssize_t
 kw_read(struct kw_connection_t *conn, void *data, size_t size)
 {
-    return read(conn->fd, data, size);
+    ssize_t rv;
+    
+    rv = read(conn->fd, data, size);
+    VERIFY(rv >= 0);
+    return rv;
 }
 
 static ssize_t
 kw_write(struct kw_connection_t *conn, const void *data, size_t size)
 {
-    return write(conn->fd, data, size);
+    ssize_t rv;
+    
+    rv = write(conn->fd, data, size);
+    VERIFY(rv == (ssize_t)size);
+    return rv;
 }
 
 static ssize_t
@@ -226,8 +241,13 @@ kw_read_ssl(struct kw_connection_t *conn, void *data, size_t size)
 static ssize_t
 kw_write_ssl(struct kw_connection_t *conn, const void *data, size_t size)
 {
+    int int_size = (int)size;
+    int rv;
+
     VERIFY(size < INT_MAX);
-    return SSL_write(conn->ssl, data, (int)size);
+    rv = SSL_write(conn->ssl, data, int_size);
+    VERIFY(rv == int_size);
+    return rv;
 }
 
 static void
@@ -537,15 +557,145 @@ kw_receive_data(struct kw_connection_t *conn)
     if (result == NULL)
         return RESULT_NEED_MORE_DATA;
 
-    data = kw_alloc(conn, data_size);
+    VERIFY(strstr(haystack, "QUIT" CRLF) == NULL);
+
+    data = kw_alloc(conn, data_size + 1);
     memmove(data, haystack, data_size);
+    data[data_size] = '\0';
+
     chunk = kw_alloc(conn, sizeof(struct kw_text_chunk_t));
     chunk->text = data;
     chunk->next = conn->data;
     conn->data = chunk;
 
     kw_send_response(conn, RESPONSE_OK);
+    syslog(LOG_NOTICE, "End of data, sending OK");
     return RESULT_OK;
+}
+
+#if 0
+static const char *kw_json[] = {
+    "{\"to\":\"",
+    "\",\"from\":\"",
+    "\",\"data\":\"",
+    "\"}" CRLF
+};
+static const size_t kw_json_entries = sizeof kw_json / sizeof kw_json[0];
+
+static size_t
+kw_curl_read_fn(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    struct kw_connection_t *connection = userdata;
+    const char *ptrs[7];
+    
+    const size_t num_fragments = sizeof ptrs / sizeof ptrs[0];
+    size_t bytes_available = size * nmemb;
+    size_t bytes_copied = 0;
+    char *dest = ptr;
+
+    ptrs[0] = kw_json[0];
+    ptrs[1] = connection->to->text;
+    ptrs[2] = kw_json[1];
+    ptrs[3] = connection->from->text;
+    ptrs[4] = kw_json[2];
+    ptrs[5] = connection->data->text;
+    ptrs[6] = kw_json[3];
+
+    for (;;)
+    {
+        size_t bytes_to_copy;
+        size_t i;
+
+        if (bytes_available == 0 || connection->post_fragment == num_fragments)
+            break;
+
+        if (connection->post_fragment_length == 0)
+            connection->post_fragment_length = strlen(ptrs[connection->post_fragment]);
+
+        bytes_to_copy = MIN(connection->post_fragment_length - connection->post_pos, bytes_available);
+        memcpy(dest, ptrs[connection->post_fragment] + connection->post_pos, bytes_to_copy);
+
+        for (i = 0; i < bytes_to_copy; ++i)
+        {
+            putchar(*(ptrs[connection->post_fragment] + connection->post_pos + i));
+        }
+
+        dest += bytes_to_copy;
+        bytes_copied += bytes_to_copy;
+        bytes_available -= bytes_to_copy;
+        connection->post_pos += bytes_to_copy;
+
+        if (connection->post_pos >= connection->post_fragment_length)
+        {
+            ++connection->post_fragment;
+            connection->post_fragment_length = 0;
+            connection->post_pos = 0;
+        }
+    }
+
+    return bytes_copied;
+}
+
+static long
+kw_data_size(struct kw_connection_t *connection)
+{
+    return (long)strlen(connection->data->text);
+}
+#endif
+static void
+kw_post_data(struct kw_connection_t *connection)
+{
+    CURL *curl;
+    long return_value;
+    CURLcode curl_return_value;
+    struct curl_httppost *first = NULL;
+    struct curl_httppost *last = NULL;
+    char error_buffer[CURL_ERROR_SIZE + 1] = { 0 };
+   
+    pid_t pid = fork();
+    VERIFY(pid >= 0);
+    if (pid > 0)
+        return;
+
+    curl_global_init(CURL_GLOBAL_ALL);
+    curl = curl_easy_init();
+    VERIFY(curl != NULL);
+    curl_return_value = curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.1.104:8000/email");
+    VERIFY(curl_return_value == 0);
+    VERIFY(curl_formadd(&first, &last,
+            CURLFORM_PTRNAME, "to",
+            CURLFORM_PTRCONTENTS, connection->to->text,
+            CURLFORM_END) == 0);
+    VERIFY(curl_formadd(&first, &last,
+            CURLFORM_PTRNAME, "from",
+            CURLFORM_PTRCONTENTS, connection->from->text,
+            CURLFORM_END) == 0);
+    VERIFY(curl_formadd(&first, &last,
+            CURLFORM_PTRNAME, "data",
+            CURLFORM_PTRCONTENTS, connection->data->text,
+            CURLFORM_END) == 0);
+    curl_easy_setopt(curl, CURLOPT_HTTPPOST, first);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+
+    curl_return_value = curl_easy_perform(curl);
+    if (curl_return_value == 0) 
+    {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &return_value);
+        printf("Transfer returned %ld\n", return_value);
+    }
+    else
+    {
+        printf("curl_easy_perform returned %d\n", curl_return_value);
+        printf("%s\n", error_buffer);
+    }
+
+    curl_formfree(first);
+    
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+
+    exit(0);
 }
 
 static void
@@ -648,6 +798,8 @@ kw_handle_command(struct kw_connection_t *conn)
     if (update_command)
         conn->command = command_union.command;
 
+    syslog(LOG_NOTICE, "%c%c%c%c", command_union.raw_data[0], command_union.raw_data[1], command_union.raw_data[2], command_union.raw_data[3]);
+
     if (rv == RESULT_OK)
         conn->buffer_recv_ptr = conn->buffer_ptr;
 }
@@ -685,6 +837,7 @@ handle_connection(int fd)
                 conn->state = STATE_HANDLE_COMMAND;
                 break;
             case STATE_DONE:
+                kw_post_data(conn);
                 kw_release_connection(conn, fd);
                 rv = 1;
                 break;
@@ -778,15 +931,11 @@ main(void)
             {
                 kw_remove_from_epoll_list(epoll_fd, current_fd);
                 close(current_fd);
-
-                /* TODO: Remove this. Temporarily exiting after each successful connection
-                         to ease debuggability so that I don't have to break out of syscalls. */
-                goto cleanup;
+/*goto done;*/
             }
         }
     }
-
-cleanup:
+/*done:*/
 
     for (i = 0; i < sizeof sockets / sizeof sockets[0]; ++i)
         close(socket_fds[i]);

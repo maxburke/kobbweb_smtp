@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -g -Wextra -Wall -pedantic -Werror
-LIBS = -lssl
+LIBS = -lssl -lcurl
 LDFLAGS = -g 
 OBJ = kobbweb_smtp.o
 %.o: %.c

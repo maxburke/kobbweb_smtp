@@ -186,6 +186,8 @@ kw_accept_and_add_to_epoll_list(int epoll_fd, int socket_fd)
     struct sockaddr_in connection;
     socklen_t size = sizeof connection;
 
+    memset(&event, 0, sizeof event);
+
     new_connection_fd = accept(socket_fd, (struct sockaddr *)&connection, &size);
     VERIFY(new_connection_fd != -1);
     fcntl(new_connection_fd, F_SETFD, O_NONBLOCK);
@@ -660,7 +662,7 @@ kw_post_data(struct kw_connection_t *connection)
     curl_global_init(CURL_GLOBAL_ALL);
     curl = curl_easy_init();
     VERIFY(curl != NULL);
-    curl_return_value = curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.1.104:8000/email");
+    curl_return_value = curl_easy_setopt(curl, CURLOPT_URL, "http://kobbweb.net/email");
     VERIFY(curl_return_value == 0);
     VERIFY(curl_formadd(&first, &last,
             CURLFORM_PTRNAME, "to",
@@ -893,6 +895,9 @@ main(void)
 #else
     int syslog_flags = 0;
 #endif
+
+    memset(&event, 0, sizeof event);
+    memset(events, 0, sizeof events);
 
     openlog("kobbweb_smtp", syslog_flags, LOG_USER);
     SSL_library_init();

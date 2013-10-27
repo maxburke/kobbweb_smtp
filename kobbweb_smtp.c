@@ -839,7 +839,8 @@ handle_connection(int fd)
                 conn->state = STATE_HANDLE_COMMAND;
                 break;
             case STATE_DONE:
-                kw_post_data(conn);
+                if (conn->to && conn->from && conn->data)
+                    kw_post_data(conn);
                 kw_release_connection(conn, fd);
                 rv = 1;
                 break;

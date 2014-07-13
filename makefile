@@ -1,4 +1,4 @@
-CC = gcc
+CC = clang
 CFLAGS = -g -Wextra -Wall -pedantic -Werror
 LIBS = -lssl -lcrypto -lcurl
 LDFLAGS = -g 
@@ -7,7 +7,7 @@ OBJ = kobbweb_smtp.o
 	$(CC) -c -o $@ $< $(CFLAGS)
 
 kobbweb_smtp: $(OBJ)
-	gcc -o $@ $^ $(LDFLAGS) $(LIBS)
+	clang -o $@ $^ $(LDFLAGS) $(LIBS)
 
 .PHONY: clean
 clean:

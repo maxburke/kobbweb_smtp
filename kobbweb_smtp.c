@@ -662,7 +662,7 @@ kw_post_data(struct kw_connection_t *connection)
     curl_global_init(CURL_GLOBAL_ALL);
     curl = curl_easy_init();
     VERIFY(curl != NULL);
-    curl_return_value = curl_easy_setopt(curl, CURLOPT_URL, "http://kobbweb.net/email");
+    curl_return_value = curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.1.110/email");
     VERIFY(curl_return_value == 0);
     VERIFY(curl_formadd(&first, &last,
             CURLFORM_PTRNAME, "to",
@@ -714,7 +714,7 @@ kw_handle_command(struct kw_connection_t *conn)
     int i;
     static const char start_tls_token[] = "STARTTLS";
     static const size_t start_tls_token_size = (sizeof start_tls_token) - 1;
-    enum kw_command_result_t rv;
+    enum kw_command_result_t rv = RESULT_OK;
     int update_command = 1;
 
     union command_union
@@ -792,6 +792,11 @@ kw_handle_command(struct kw_connection_t *conn)
                 if (rv == RESULT_NEED_MORE_DATA && conn->buffer_recv_ptr == conn->buffer_end)
                     kw_send_response(conn, ERROR_EXCEEDED_STORAGE);
             }
+            else
+            {
+                /* If an unknown message is received, kill the connection */
+                conn->state = STATE_DONE;
+            }
             break;
     }
 
@@ -800,10 +805,11 @@ kw_handle_command(struct kw_connection_t *conn)
     if (update_command)
         conn->command = command_union.command;
 
-    syslog(LOG_NOTICE, "%c%c%c%c", command_union.raw_data[0], command_union.raw_data[1], command_union.raw_data[2], command_union.raw_data[3]);
-
     if (rv == RESULT_OK)
+    {
+        syslog(LOG_NOTICE, "%c%c%c%c", command_union.raw_data[0], command_union.raw_data[1], command_union.raw_data[2], command_union.raw_data[3]);
         conn->buffer_recv_ptr = conn->buffer_ptr;
+    }
 }
 
 static int
